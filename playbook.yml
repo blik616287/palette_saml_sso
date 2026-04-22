@@ -1,0 +1,80 @@
+---
+# =============================================================================
+# Palette <-> JumpCloud SAML SSO automation
+#
+# Configures a JumpCloud SAML app and wires a Palette tenant to use it.
+# All configuration lives in inventory/group_vars/all.yml; every value there
+# can be overridden at runtime via the matching env var.
+#
+# Usage:
+#   ansible-playbook -i inventory playbook.yml
+# =============================================================================
+
+- name: Configure Palette <-> JumpCloud SAML SSO
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  # Variables are defined in inventory/group_vars/all.yml. Every value can be
+  # overridden at runtime via the corresponding env var.
+
+  pre_tasks:
+    - name: Validate required credentials
+      ansible.builtin.assert:
+        that:
+          - jumpcloud_api_key | length > 0
+          - palette_base_url | length > 0
+          - palette_system_password | length > 0
+          - palette_tenant_admin | length > 0
+          - palette_tenant_password | length > 0
+          - palette_tenant_name | length > 0
+        fail_msg: >-
+          Missing required variables. Set them in
+          inventory/group_vars/all.yml or as env vars
+          (JUMPCLOUD_API_KEY, PALETTE_BASE_URL, PALETTE_SYSTEM_PASSWORD,
+          PALETTE_TENANT_ADMIN, PALETTE_TENANT_PASSWORD, PALETTE_TENANT_NAME).
+
+    - name: Show tenant naming
+      ansible.builtin.debug:
+        msg:
+          - "Tenant name:       {{ palette_tenant_name }}"
+          - "Tenant URL:        {{ palette_tenant_url }}"
+          - "JumpCloud app:     {{ jumpcloud_app_label }}"
+          - "JumpCloud IdP URL: {{ jumpcloud_idp_url }}"
+          - "JumpCloud group:   {{ jumpcloud_group_name }}"
+          - "Palette team:      {{ palette_team_name }}"
+
+  tasks:
+    - name: Ensure Palette tenant exists and is active
+      ansible.builtin.include_tasks: tasks/palette_tenant_ensure.yml
+
+    - name: Authenticate to Palette tenant
+      ansible.builtin.include_tasks: tasks/palette_auth.yml
+
+    - name: Configure JumpCloud SAML app
+      ansible.builtin.include_tasks: tasks/jumpcloud_app.yml
+
+    - name: Configure JumpCloud user group
+      ansible.builtin.include_tasks: tasks/jumpcloud_group.yml
+
+    - name: Manage JumpCloud group membership (optional)
+      ansible.builtin.include_tasks: tasks/jumpcloud_group_members.yml
+
+    - name: Configure Palette SAML + team
+      ansible.builtin.include_tasks: tasks/palette_saml_config.yml
+
+  post_tasks:
+    - name: Display summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - " Palette SAML SSO Configuration Complete"
+          - "============================================"
+          - "Tenant:              {{ palette_tenant_name }} ({{ palette_tenant_uid }})"
+          - "Tenant URL:          {{ palette_tenant_url }}"
+          - "JumpCloud App ID:    {{ jumpcloud_app_id }}"
+          - "JumpCloud App Label: {{ jumpcloud_app_label }}"
+          - "JumpCloud IdP URL:   {{ jumpcloud_idp_url }}"
+          - "JumpCloud Group:     {{ jumpcloud_group_name }}"
+          - "Palette Team:        {{ palette_team_name }} -> {{ palette_team_role_name }}"
+          - "============================================"

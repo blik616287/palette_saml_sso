@@ -1,0 +1,197 @@
+---
+# Palette: push JumpCloud IdP metadata + set up team for SpectroTeam mapping
+
+- name: Build updated SAML config payload
+  ansible.builtin.set_fact:
+    palette_saml_update: >-
+      {{ palette_saml_config | combine({
+          'federationMetadata': jumpcloud_metadata_b64,
+          'identityProvider': 'Others',
+          'isSsoEnabled': true,
+          'syncSsoTeams': true
+         }) }}
+
+- name: Push updated SAML config to Palette
+  ansible.builtin.uri:
+    url: "{{ palette_tenant_url }}/v1/tenants/{{ palette_tenant_uid }}/saml/config"
+    method: POST
+    validate_certs: false
+    headers:
+      Authorization: "{{ palette_tenant_token }}"
+      Content-Type: application/json
+    body_format: json
+    body: "{{ palette_saml_update }}"
+    status_code: [200, 204]
+
+# The Palette saml/config POST endpoint silently ignores `syncSsoTeams`.
+# Work around this by writing directly to MongoDB via kubectl + mongosh.
+# Requires `aws` and `kubectl` on PATH and access to the Palette EKS cluster.
+- name: Force syncSsoTeams=true via MongoDB
+  when: palette_skip_mongo_sync_fix | default(false) | bool == false
+  block:
+    - name: Update kubeconfig for Palette EKS cluster
+      ansible.builtin.command: >-
+        aws eks update-kubeconfig
+        --name {{ palette_eks_cluster_name }}
+        --region {{ palette_aws_region }}
+        {% if palette_aws_profile | length > 0 %}--profile {{ palette_aws_profile }}{% endif %}
+        --kubeconfig /tmp/palette-sso-kubeconfig
+      changed_when: false
+
+    - name: Fetch MongoDB password from cluster secret
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /tmp/palette-sso-kubeconfig
+        get secret spectromongosecret -n hubble-system
+        -o jsonpath={.data.spectroDbPassword}
+      register: mongo_pass_b64
+      changed_when: false
+
+    - name: Decode MongoDB password
+      ansible.builtin.set_fact:
+        mongo_password: "{{ mongo_pass_b64.stdout | b64decode }}"
+
+    - name: Find MongoDB primary pod
+      ansible.builtin.shell: |
+        set -eo pipefail
+        for i in 0 1 2; do
+          m=$(kubectl --kubeconfig /tmp/palette-sso-kubeconfig exec -n hubble-system mongo-${i} -c mongo -- \
+            mongosh --quiet -u root -p '{{ mongo_password }}' --authenticationDatabase admin \
+            --eval 'db.isMaster().ismaster' 2>/dev/null | tail -1 | tr -d '[:space:]')
+          if [ "$m" = "true" ]; then echo "mongo-${i}"; exit 0; fi
+        done
+        exit 1
+      args:
+        executable: /bin/bash
+      register: mongo_primary
+      changed_when: false
+
+    - name: Set spec.authSpec.syncSsoTeams=true in MongoDB tenant record
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/tmp/palette-sso-kubeconfig
+          - exec
+          - -n
+          - hubble-system
+          - "{{ mongo_primary.stdout }}"
+          - -c
+          - mongo
+          - --
+          - mongosh
+          - --quiet
+          - -u
+          - root
+          - -p
+          - "{{ mongo_password }}"
+          - --authenticationDatabase
+          - admin
+          - --eval
+          - "JSON.stringify(db.getSiblingDB('hubbledb').tenants.updateOne({_id:'{{ palette_tenant_uid }}'},{$set:{'spec.authSpec.syncSsoTeams':true}}))"
+      register: mongo_update
+      changed_when: "'modifiedCount\\\" : 1' in mongo_update.stdout or 'matchedCount\\\" : 1' in mongo_update.stdout"
+
+    - name: Verify syncSsoTeams is now true
+      ansible.builtin.uri:
+        url: "{{ palette_tenant_url }}/v1/tenants/{{ palette_tenant_uid }}/saml/config"
+        validate_certs: false
+        headers:
+          Authorization: "{{ palette_tenant_token }}"
+        return_content: true
+      register: verify_sync
+
+    - name: Assert syncSsoTeams persisted
+      ansible.builtin.assert:
+        that: verify_sync.json.syncSsoTeams | bool
+        fail_msg: "syncSsoTeams is still false after MongoDB update"
+
+  rescue:
+    - name: Warn that syncSsoTeams could not be set automatically
+      ansible.builtin.debug:
+        msg: |
+          WARNING: Could not enable syncSsoTeams automatically.
+          Palette's saml/config API silently ignores this flag and the
+          kubectl/mongo fallback failed (missing aws/kubectl on PATH, or no
+          access to the Palette EKS cluster).
+
+          To enable manually, set it in the Palette tenant UI:
+            Tenant Settings -> SSO -> SAML -> "Enable Auto Sync of SSO Teams"
+          Or run the playbook on a host that has aws + kubectl configured
+          for the Palette EKS cluster.
+
+- name: List Palette roles (to resolve role name to UID)
+  ansible.builtin.uri:
+    url: "{{ palette_tenant_url }}/v1/roles?scope=tenant"
+    validate_certs: false
+    headers:
+      Authorization: "{{ palette_tenant_token }}"
+    return_content: true
+  register: palette_roles
+
+- name: Find target role UID
+  ansible.builtin.set_fact:
+    palette_team_role_uid: >-
+      {{ (palette_roles.json['items'] |
+          selectattr('metadata.name', 'equalto', palette_team_role_name) |
+          list | first).metadata.uid }}
+
+- name: List Palette teams
+  ansible.builtin.uri:
+    url: "{{ palette_tenant_url }}/v1/teams"
+    validate_certs: false
+    headers:
+      Authorization: "{{ palette_tenant_token }}"
+    return_content: true
+  register: palette_teams
+
+- name: Find existing team matching SpectroTeam attribute
+  ansible.builtin.set_fact:
+    palette_team_existing: >-
+      {{ palette_teams.json['items'] |
+         selectattr('metadata.name', 'equalto', palette_team_name) |
+         list | first | default({}) }}
+
+- name: Create Palette team if not present
+  when: palette_team_existing.metadata is not defined
+  ansible.builtin.uri:
+    url: "{{ palette_tenant_url }}/v1/teams"
+    method: POST
+    validate_certs: false
+    headers:
+      Authorization: "{{ palette_tenant_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      metadata:
+        name: "{{ palette_team_name }}"
+      spec:
+        roles:
+          - "{{ palette_team_role_uid }}"
+        users: []
+    status_code: [200, 201]
+    return_content: true
+  register: team_created
+
+- name: Set Palette team UID
+  ansible.builtin.set_fact:
+    palette_team_uid: >-
+      {{ team_created.json.uid | default(team_created.json.metadata.uid | default(palette_team_existing.metadata.uid)) }}
+
+- name: Ensure team has the target role assigned
+  when: palette_team_existing.metadata is defined
+  ansible.builtin.uri:
+    url: "{{ palette_tenant_url }}/v1/teams/{{ palette_team_uid }}"
+    method: PUT
+    validate_certs: false
+    headers:
+      Authorization: "{{ palette_tenant_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      metadata:
+        name: "{{ palette_team_name }}"
+        uid: "{{ palette_team_uid }}"
+      spec:
+        roles: "{{ (palette_team_existing.spec.roles | default([]) + [palette_team_role_uid]) | unique }}"
+        users: "{{ palette_team_existing.spec.users | default([]) }}"
+    status_code: [200, 204]
+  failed_when: false

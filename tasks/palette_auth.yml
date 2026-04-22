@@ -1,0 +1,38 @@
+---
+# Authenticate as Palette tenant admin.
+# Assumes palette_tenant_ensure.yml already ensured the tenant is active
+# and set palette_tenant_uid.
+
+- name: Authenticate as tenant admin
+  ansible.builtin.uri:
+    url: "{{ palette_tenant_url }}/v1/auth/authenticate"
+    method: POST
+    validate_certs: false
+    body_format: json
+    body:
+      emailId: "{{ palette_tenant_admin }}"
+      password: "{{ palette_tenant_password }}"
+    return_content: true
+  register: tenant_login
+
+- name: Fail if tenant login failed
+  ansible.builtin.fail:
+    msg: "Tenant admin login failed for {{ palette_tenant_admin }}"
+  when: tenant_login.json.Authorization is not defined
+
+- name: Store tenant admin token
+  ansible.builtin.set_fact:
+    palette_tenant_token: "{{ tenant_login.json.Authorization }}"
+
+- name: Fetch current Palette SAML config
+  ansible.builtin.uri:
+    url: "{{ palette_tenant_url }}/v1/tenants/{{ palette_tenant_uid }}/saml/config"
+    validate_certs: false
+    headers:
+      Authorization: "{{ palette_tenant_token }}"
+    return_content: true
+  register: palette_saml_current
+
+- name: Store Palette SAML facts
+  ansible.builtin.set_fact:
+    palette_saml_config: "{{ palette_saml_current.json }}"

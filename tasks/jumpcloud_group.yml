@@ -1,0 +1,82 @@
+---
+# JumpCloud group tasks
+#
+# Creates the user group if missing, tagging it with a marker so teardown
+# can safely identify groups it owns vs. pre-existing groups.
+#
+# The marker is written to the group's `description` field:
+#   "Managed by palette-saml-sso playbook"
+#
+# Scope:
+#   - Creates only if no group with this exact name exists
+#   - Existing groups (user-created) are left alone (only associated with app)
+
+- name: Paginate JumpCloud user groups to find the target group
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/v2/usergroups?limit=100&skip={{ item }}"
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+    return_content: true
+  register: jc_groups_pages
+  loop: "{{ range(0, 1000, 100) | list }}"
+
+- name: Flatten all groups
+  ansible.builtin.set_fact:
+    all_jc_groups: "{{ jc_groups_pages.results | map(attribute='json') | flatten }}"
+
+- name: Find target JumpCloud group by exact name
+  ansible.builtin.set_fact:
+    jumpcloud_group: >-
+      {{ all_jc_groups |
+         selectattr('name', 'equalto', jumpcloud_group_name) |
+         list | first | default({}) }}
+
+- name: Create JumpCloud user group if missing (tagged with managed-by marker)
+  when: jumpcloud_group.id is not defined
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/v2/usergroups"
+    method: POST
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: "{{ jumpcloud_group_name }}"
+      type: "user_group"
+      description: "{{ jumpcloud_group_marker }}"
+    status_code: [200, 201]
+    return_content: true
+  register: jc_group_created
+
+- name: Set JumpCloud group ID
+  ansible.builtin.set_fact:
+    jumpcloud_group_id: >-
+      {{ jc_group_created.json.id
+         if jc_group_created is defined and jc_group_created.json is defined
+         else jumpcloud_group.id }}
+
+- name: Check current associations on the SAML app
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/v2/applications/{{ jumpcloud_app_id }}/usergroups"
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+    return_content: true
+  register: app_current_groups
+
+- name: Associate user group with SAML app (idempotent)
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/v2/usergroups/{{ jumpcloud_group_id }}/associations"
+    method: POST
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      op: "add"
+      type: "application"
+      id: "{{ jumpcloud_app_id }}"
+    status_code: [200, 204, 409]
+  when: >-
+    jumpcloud_group_id not in (app_current_groups.json | default([]) |
+      selectattr('type', 'equalto', 'user_group') |
+      map(attribute='id') | list)

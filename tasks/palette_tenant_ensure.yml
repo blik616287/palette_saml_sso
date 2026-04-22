@@ -1,0 +1,167 @@
+---
+# Ensure the Palette tenant exists and is active.
+# Uses the system admin to list/create/activate the tenant.
+
+- name: System admin login
+  ansible.builtin.uri:
+    url: "{{ palette_system_url }}/v1/auth/syslogin"
+    method: POST
+    validate_certs: false
+    body_format: json
+    body:
+      username: admin
+      password: "{{ palette_system_password }}"
+    return_content: true
+  register: sys_login
+
+- name: Store system admin token
+  ansible.builtin.set_fact:
+    palette_system_token: "{{ sys_login.json.Authorization }}"
+
+- name: List existing tenants
+  ansible.builtin.uri:
+    url: "{{ palette_system_url }}/v1/tenants"
+    validate_certs: false
+    headers:
+      Authorization: "{{ palette_system_token }}"
+    return_content: true
+  register: tenants_list
+
+- name: Find target tenant by orgName
+  ansible.builtin.set_fact:
+    existing_tenant: >-
+      {{ (tenants_list.json['items'] | default([])) |
+         selectattr('spec.orgName', 'equalto', palette_tenant_name | lower) |
+         list | first | default({}) }}
+
+- name: Create tenant if missing
+  when: existing_tenant.metadata is not defined
+  ansible.builtin.uri:
+    url: "{{ palette_system_url }}/v1/tenants"
+    method: POST
+    validate_certs: false
+    headers:
+      Authorization: "{{ palette_system_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      metadata:
+        name: "{{ palette_tenant_name }}"
+      spec:
+        orgName: "{{ palette_tenant_name }}"
+        emailId: "{{ palette_tenant_admin }}"
+        authType: "password"
+    status_code: [200, 201]
+    return_content: true
+  register: tenant_created
+
+- name: Refresh tenant list after creation
+  when: tenant_created is defined and tenant_created.status is defined and tenant_created.status in [200, 201]
+  ansible.builtin.uri:
+    url: "{{ palette_system_url }}/v1/tenants"
+    validate_certs: false
+    headers:
+      Authorization: "{{ palette_system_token }}"
+    return_content: true
+  register: tenants_list_after_create
+
+- name: Refresh existing_tenant fact after creation
+  when: tenant_created is defined and tenant_created.status is defined and tenant_created.status in [200, 201]
+  ansible.builtin.set_fact:
+    existing_tenant: >-
+      {{ (tenants_list_after_create.json['items'] | default([])) |
+         selectattr('spec.orgName', 'equalto', palette_tenant_name | lower) |
+         list | first | default({}) }}
+
+- name: Fail if tenant still not found
+  ansible.builtin.fail:
+    msg: "Failed to locate or create tenant {{ palette_tenant_name }}"
+  when: existing_tenant.metadata is not defined
+
+- name: Store tenant UID
+  ansible.builtin.set_fact:
+    palette_tenant_uid: "{{ existing_tenant.metadata.uid }}"
+
+- name: Activate tenant if soft-deleted
+  when: existing_tenant.metadata.annotations.deleted | default('false') | lower == 'true'
+  ansible.builtin.uri:
+    url: "{{ palette_system_url }}/v1/tenants/{{ palette_tenant_uid }}/activate"
+    method: PATCH
+    validate_certs: false
+    headers:
+      Authorization: "{{ palette_system_token }}"
+    body_format: json
+    body: {}
+    status_code: [200, 204]
+  failed_when: false
+
+- name: Clear soft-delete markers in MongoDB if still set
+  when:
+    - existing_tenant.metadata.annotations.deleted | default('false') | lower == 'true'
+    - palette_skip_mongo_sync_fix | default(false) | bool == false
+  block:
+    - name: Update kubeconfig for Palette EKS cluster
+      ansible.builtin.command: >-
+        aws eks update-kubeconfig
+        --name {{ palette_eks_cluster_name }}
+        --region {{ palette_aws_region }}
+        {% if palette_aws_profile | length > 0 %}--profile {{ palette_aws_profile }}{% endif %}
+        --kubeconfig /tmp/palette-sso-kubeconfig
+      changed_when: false
+
+    - name: Fetch MongoDB password
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /tmp/palette-sso-kubeconfig
+        get secret spectromongosecret -n hubble-system
+        -o jsonpath={.data.spectroDbPassword}
+      register: mongo_pass_b64
+      changed_when: false
+
+    - name: Decode MongoDB password
+      ansible.builtin.set_fact:
+        mongo_password: "{{ mongo_pass_b64.stdout | b64decode }}"
+
+    - name: Find MongoDB primary pod
+      ansible.builtin.shell: |
+        set -eo pipefail
+        for i in 0 1 2; do
+          m=$(kubectl --kubeconfig /tmp/palette-sso-kubeconfig exec -n hubble-system mongo-${i} -c mongo -- \
+            mongosh --quiet -u root -p '{{ mongo_password }}' --authenticationDatabase admin \
+            --eval 'db.isMaster().ismaster' 2>/dev/null | tail -1 | tr -d '[:space:]')
+          if [ "$m" = "true" ]; then echo "mongo-${i}"; exit 0; fi
+        done
+        exit 1
+      args:
+        executable: /bin/bash
+      register: mongo_primary
+      changed_when: false
+
+    - name: Clear tenant deletion flags in MongoDB
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/tmp/palette-sso-kubeconfig
+          - exec
+          - -n
+          - hubble-system
+          - "{{ mongo_primary.stdout }}"
+          - -c
+          - mongo
+          - --
+          - mongosh
+          - --quiet
+          - -u
+          - root
+          - -p
+          - "{{ mongo_password }}"
+          - --authenticationDatabase
+          - admin
+          - --eval
+          - >-
+            db.getSiblingDB('hubbledb').tenants.updateOne(
+              {_id:'{{ palette_tenant_uid }}'},
+              {$set:{'metadata.isDeleted':false,
+                    'metadata.deletionTimestamp':new Date('0001-01-01T00:00:00.000Z')},
+               $unset:{'metadata.annotations.deleted':''}}
+            )
+      changed_when: true

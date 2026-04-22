@@ -1,0 +1,61 @@
+---
+# =============================================================================
+# Palette <-> JumpCloud SAML SSO configuration
+#
+# Every value below can be overridden at runtime via an environment variable
+# of the same uppercased name (e.g. PALETTE_TENANT_NAME). Edit this file for
+# persistent per-environment defaults; use env vars for one-off overrides or
+# CI/CD secret injection.
+# =============================================================================
+
+# --- Tenant identity ---------------------------------------------------------
+# Drives naming of every generated resource (JumpCloud app/group, Palette
+# team, tenant URL subdomain). Palette lowercases orgName on create, so the
+# URL slug is derived as `palette_tenant_name | lower`.
+palette_tenant_name: "{{ lookup('env', 'PALETTE_TENANT_NAME') | default('default', true) }}"
+
+# --- JumpCloud ---------------------------------------------------------------
+jumpcloud_api_key: "{{ lookup('env', 'JUMPCLOUD_API_KEY') }}"
+
+# Users to add to the tenant's SpectroTeam JumpCloud group. Each email must
+# already exist as a user in JumpCloud. Leave the list empty to skip group
+# membership management entirely.
+jumpcloud_group_members:
+  - marty@insightsoftmax.net
+
+# --- Palette -----------------------------------------------------------------
+palette_base_url: "{{ lookup('env', 'PALETTE_BASE_URL') | default('https://palette.isc-spectro-dev.click', true) }}"
+palette_system_password: "{{ lookup('env', 'PALETTE_SYSTEM_PASSWORD') }}"
+palette_tenant_admin: "{{ lookup('env', 'PALETTE_TENANT_ADMIN') | default('marty@insightsoftmax.com', true) }}"
+palette_tenant_password: "{{ lookup('env', 'PALETTE_TENANT_PASSWORD') }}"
+
+# Role assigned to the auto-created Palette team. Must be an existing role
+# name in the tenant (e.g. "Tenant Admin", "Tenant Resource Viewer", ...).
+palette_team_role_name: "{{ lookup('env', 'PALETTE_TEAM_ROLE_NAME') | default('Tenant Admin', true) }}"
+
+# --- EKS access (for MongoDB fallback paths) ---------------------------------
+# Used only to (a) un-soft-delete a tenant and (b) force syncSsoTeams=true,
+# both of which the Palette REST API does not expose. Requires `aws` and
+# `kubectl` on PATH with access to the Palette EKS control plane.
+palette_eks_cluster_name: "{{ lookup('env', 'PALETTE_EKS_CLUSTER_NAME') | default('spectroihmeae-ue2-palette', true) }}"
+palette_aws_region: "{{ lookup('env', 'AWS_REGION') | default('us-east-2', true) }}"
+palette_aws_profile: "{{ lookup('env', 'AWS_PROFILE') | default('spectro', true) }}"
+
+# Set true if the environment lacks EKS/kubectl access and syncSsoTeams can
+# be ignored (users will still auth, but Palette won't auto-provision teams).
+palette_skip_mongo_sync_fix: "{{ lookup('env', 'PALETTE_SKIP_MONGO_SYNC_FIX') | default(false, true) | bool }}"
+
+# --- Derived values (do not edit) --------------------------------------------
+palette_tenant_slug: "{{ palette_tenant_name | lower }}"
+palette_system_url: "{{ palette_base_url }}"
+palette_tenant_url: "{{ palette_base_url | regex_replace('^(https?://)', '\\1' + palette_tenant_slug + '.') }}"
+palette_sp_entity_id: "{{ palette_system_url }}"
+palette_acs_url: "{{ palette_system_url }}/v1/auth/org/{{ palette_tenant_slug }}/saml/callback"
+
+jumpcloud_idp_url_name: "{{ palette_tenant_slug }}-palette"
+jumpcloud_idp_url: "https://sso.jumpcloud.com/saml2/{{ jumpcloud_idp_url_name }}"
+jumpcloud_app_label: "{{ palette_tenant_name }}-Palette"
+jumpcloud_group_name: "{{ palette_tenant_name }}-SpectroTeam"
+jumpcloud_group_marker: "Managed by palette-saml-sso playbook (tenant: {{ palette_tenant_slug }})"
+
+palette_team_name: "{{ palette_tenant_name }}-SpectroTeam"

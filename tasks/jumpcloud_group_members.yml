@@ -1,0 +1,84 @@
+---
+# Optional: add users to the SpectroTeam user group by email lookup.
+# Variable: jumpcloud_group_members = [ "user1@example.com", "user2@example.com" ]
+# If empty, this whole file is a no-op.
+
+- name: JumpCloud group membership - skip notice
+  ansible.builtin.debug:
+    msg: "No jumpcloud_group_members set; skipping group membership sync."
+  when: (jumpcloud_group_members | default([]) | length) == 0
+
+- name: Manage JumpCloud group membership
+  when: (jumpcloud_group_members | default([]) | length) > 0
+  block:
+    - name: Look up each JumpCloud user by email
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/systemusers"
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        body_format: form-urlencoded
+        body:
+          "search.fields": "email"
+          "search.searchTerm": "{{ item }}"
+        return_content: true
+      register: jc_user_lookups
+      loop: "{{ jumpcloud_group_members }}"
+
+    - name: Resolve each email to an exact JumpCloud user match
+      ansible.builtin.set_fact:
+        resolved_user_map: >-
+          {{ resolved_user_map | default({}) | combine({
+               item.0: ((item.1.json.results | default([])) |
+                        selectattr('email', 'equalto', item.0) |
+                        list | first | default(none))
+             }) }}
+      loop: "{{ jumpcloud_group_members | zip(jc_user_lookups.results) | list }}"
+      loop_control:
+        label: "{{ item.0 }}"
+
+    - name: Fail if any user was not found in JumpCloud
+      ansible.builtin.fail:
+        msg: >-
+          JumpCloud user not found for email: {{ item }}.
+          Create the user in JumpCloud before re-running, or remove from
+          jumpcloud_group_members.
+      when: resolved_user_map[item] is none
+      loop: "{{ jumpcloud_group_members }}"
+
+    - name: Build resolved user list
+      ansible.builtin.set_fact:
+        resolved_users: "{{ jumpcloud_group_members | map('extract', resolved_user_map) | list }}"
+
+    - name: Fetch current SpectroTeam members
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/v2/usergroups/{{ jumpcloud_group_id }}/members"
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        return_content: true
+      register: current_members
+
+    - name: Extract current member user IDs
+      ansible.builtin.set_fact:
+        current_member_ids: >-
+          {{ (current_members.json | default([])) |
+             selectattr('to.type', 'defined') |
+             selectattr('to.type', 'equalto', 'user') |
+             map(attribute='to.id') | list }}
+
+    - name: Add each target user to the SpectroTeam group (idempotent)
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/v2/usergroups/{{ jumpcloud_group_id }}/members"
+        method: POST
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          op: "add"
+          type: "user"
+          id: "{{ item._id }}"
+        status_code: [200, 204, 409]
+      loop: "{{ resolved_users }}"
+      loop_control:
+        label: "{{ item.email }}"
+      when: item._id not in current_member_ids

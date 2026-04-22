@@ -1,0 +1,257 @@
+---
+# =============================================================================
+# Palette <-> JumpCloud SAML SSO teardown
+#
+# SCOPE (all prefixed by palette_tenant_name):
+#   JumpCloud: SAML app whose ssoUrl matches https://sso.jumpcloud.com/saml2/{tenant}-palette
+#   JumpCloud: user groups that are BOTH associated with that app AND tagged with
+#              "Managed by palette-saml-sso playbook (tenant: {tenant})"
+#              Pre-existing groups (no marker) are only disassociated, never deleted.
+#   Palette:   SAML config of the target tenant (federationMetadata cleared)
+#   Palette:   the "{tenant}-SpectroTeam" team in that tenant (deleted)
+#
+# It will NEVER:
+#   - Delete any other JumpCloud application
+#   - Delete any JumpCloud user group that this playbook did not create
+#   - Delete the Palette tenant itself (only resets its SAML config)
+#   - Delete any Palette user
+# =============================================================================
+
+- name: Teardown Palette <-> JumpCloud SAML SSO
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  # Variables are defined in inventory/group_vars/all.yml. Every value can be
+  # overridden at runtime via the corresponding env var.
+
+  pre_tasks:
+    - name: Validate required credentials
+      ansible.builtin.assert:
+        that:
+          - jumpcloud_api_key | length > 0
+          - palette_base_url | length > 0
+          - palette_tenant_admin | length > 0
+          - palette_tenant_password | length > 0
+          - palette_system_password | length > 0
+        fail_msg: >-
+          Missing required variables. Set them in
+          inventory/group_vars/all.yml or as env vars
+          (JUMPCLOUD_API_KEY, PALETTE_BASE_URL, PALETTE_SYSTEM_PASSWORD,
+          PALETTE_TENANT_ADMIN, PALETTE_TENANT_PASSWORD).
+
+  tasks:
+    # --- JumpCloud side ---
+    - name: List JumpCloud applications
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/applications?limit=100"
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        return_content: true
+      register: jc_apps
+
+    - name: Find target Palette app by exact ssoUrl
+      ansible.builtin.set_fact:
+        target_app: >-
+          {{ jc_apps.json['results'] |
+             selectattr('ssoUrl', 'defined') |
+             selectattr('ssoUrl', 'equalto', jumpcloud_idp_url) |
+             list | first | default({}) }}
+
+    - name: Get groups currently associated with the app
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/v2/applications/{{ target_app._id }}/usergroups"
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        return_content: true
+      register: app_groups_raw
+      when: target_app._id is defined
+
+    - name: Extract associated group IDs
+      ansible.builtin.set_fact:
+        associated_group_ids: >-
+          {{ (app_groups_raw.json | default([])) |
+             selectattr('type', 'equalto', 'user_group') |
+             map(attribute='id') | list }}
+      when: target_app._id is defined
+
+    - name: Fetch full details of each associated group
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/v2/usergroups/{{ item }}"
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        return_content: true
+      register: group_details
+      loop: "{{ associated_group_ids | default([]) }}"
+      when: target_app._id is defined
+
+    - name: Identify owned-and-marked groups
+      ansible.builtin.set_fact:
+        groups_to_delete: >-
+          {{ (group_details.results | default([])) |
+             selectattr('json.description', 'defined') |
+             selectattr('json.description', 'equalto', jumpcloud_group_marker) |
+             map(attribute='json') |
+             list }}
+      when: target_app._id is defined
+
+    - name: Delete Palette SAML app
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/applications/{{ target_app._id }}"
+        method: DELETE
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        status_code: [200, 204]
+      when: target_app._id is defined
+
+    - name: Delete owned-and-associated groups
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/v2/usergroups/{{ item.id }}"
+        method: DELETE
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        status_code: [200, 204]
+      loop: "{{ groups_to_delete | default([]) }}"
+      when: target_app._id is defined
+
+    - name: Record deletion summary
+      ansible.builtin.set_fact:
+        deleted_group_names: "{{ (groups_to_delete | default([])) | map(attribute='name') | list }}"
+        preserved_group_names: >-
+          {{ ((group_details.results | default([])) |
+              map(attribute='json') | list) |
+              rejectattr('description', 'defined') | map(attribute='name') | list +
+             ((group_details.results | default([])) |
+              map(attribute='json') | list) |
+              selectattr('description', 'defined') |
+              rejectattr('description', 'equalto', jumpcloud_group_marker) |
+              map(attribute='name') | list }}
+
+    # --- Palette side ---
+    - name: System admin login
+      ansible.builtin.uri:
+        url: "{{ palette_system_url }}/v1/auth/syslogin"
+        method: POST
+        validate_certs: false
+        body_format: json
+        body:
+          username: admin
+          password: "{{ palette_system_password }}"
+        return_content: true
+      register: sys_login
+
+    - name: Store system admin token
+      ansible.builtin.set_fact:
+        palette_system_token: "{{ sys_login.json.Authorization }}"
+
+    - name: Find tenant UID
+      ansible.builtin.uri:
+        url: "{{ palette_system_url }}/v1/tenants"
+        validate_certs: false
+        headers:
+          Authorization: "{{ palette_system_token }}"
+        return_content: true
+      register: tenants_list
+
+    - name: Set tenant UID
+      ansible.builtin.set_fact:
+        palette_tenant_uid: >-
+          {{ (tenants_list.json['items'] | default([])) |
+             selectattr('spec.orgName', 'equalto', palette_tenant_name | lower) |
+             list | first | default({}) | json_query('metadata.uid') | default('') }}
+
+    - name: Skip Palette cleanup if tenant not found
+      ansible.builtin.meta: end_play
+      when: palette_tenant_uid | length == 0
+
+    - name: Authenticate as tenant admin
+      ansible.builtin.uri:
+        url: "{{ palette_tenant_url }}/v1/auth/authenticate"
+        method: POST
+        validate_certs: false
+        body_format: json
+        body:
+          emailId: "{{ palette_tenant_admin }}"
+          password: "{{ palette_tenant_password }}"
+        return_content: true
+      register: tenant_login
+      failed_when: false
+
+    - name: Store tenant admin token if login succeeded
+      ansible.builtin.set_fact:
+        palette_tenant_token: "{{ tenant_login.json.Authorization }}"
+      when: tenant_login.json.Authorization is defined
+
+    - name: Fetch current Palette SAML config
+      ansible.builtin.uri:
+        url: "{{ palette_tenant_url }}/v1/tenants/{{ palette_tenant_uid }}/saml/config"
+        validate_certs: false
+        headers:
+          Authorization: "{{ palette_tenant_token }}"
+        return_content: true
+      register: palette_saml_current
+      when: palette_tenant_token is defined
+
+    - name: Reset Palette SAML config
+      ansible.builtin.uri:
+        url: "{{ palette_tenant_url }}/v1/tenants/{{ palette_tenant_uid }}/saml/config"
+        method: POST
+        validate_certs: false
+        headers:
+          Authorization: "{{ palette_tenant_token }}"
+          Content-Type: application/json
+        body_format: json
+        body: >-
+          {{ palette_saml_current.json | combine({
+              'federationMetadata': '',
+              'isSsoEnabled': false,
+              'syncSsoTeams': false,
+              'identityProvider': 'Others'
+             }) }}
+        status_code: [200, 204]
+      when: palette_saml_current is defined and palette_saml_current.json is defined
+
+    - name: List Palette teams
+      ansible.builtin.uri:
+        url: "{{ palette_tenant_url }}/v1/teams"
+        validate_certs: false
+        headers:
+          Authorization: "{{ palette_tenant_token }}"
+        return_content: true
+      register: palette_teams
+      when: palette_tenant_token is defined
+
+    - name: Find target Palette team
+      ansible.builtin.set_fact:
+        target_team: >-
+          {{ palette_teams.json['items'] |
+             selectattr('metadata.name', 'equalto', palette_team_name) |
+             list | first | default({}) }}
+      when: palette_teams is defined and palette_teams.json is defined
+
+    - name: Delete target Palette team
+      ansible.builtin.uri:
+        url: "{{ palette_tenant_url }}/v1/teams/{{ target_team.metadata.uid }}"
+        method: DELETE
+        validate_certs: false
+        headers:
+          Authorization: "{{ palette_tenant_token }}"
+        status_code: [200, 204]
+      when:
+        - target_team is defined
+        - target_team.metadata is defined
+
+  post_tasks:
+    - name: Teardown summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - " Palette SAML SSO Teardown Complete"
+          - "============================================"
+          - "Tenant:                    {{ palette_tenant_name }}"
+          - "JumpCloud app deleted:     {{ 'yes (' + target_app._id + ')' if target_app._id is defined else 'no (not found)' }}"
+          - "JumpCloud groups deleted:  {{ deleted_group_names | default([]) }}"
+          - "JumpCloud groups preserved: {{ preserved_group_names | default([]) }}"
+          - "Palette SAML config:       reset"
+          - "Palette team deleted:      {{ palette_team_name + ' (yes)' if (target_team.metadata is defined) else 'no (not found)' }}"
+          - "============================================"
