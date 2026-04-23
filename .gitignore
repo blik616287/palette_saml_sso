@@ -17,6 +17,7 @@ vault_password
 kubeconfig
 secrets.yml
 secrets.yaml
+sso-env.sh
 
 # Python
 __pycache__/

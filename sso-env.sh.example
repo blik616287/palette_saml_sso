@@ -1,0 +1,30 @@
+# =============================================================================
+# Environment variables for the Palette JumpCloud SSO integration.
+#
+# Copy to sso-env.sh and fill in the real values. The unsuffixed filename
+# is gitignored so secrets won't get committed.
+#
+#   cp sso-env.sh.example sso-env.sh
+#   chmod 600 sso-env.sh
+#   # edit sso-env.sh
+#   source sso-env.sh
+# =============================================================================
+
+# --- Required ---------------------------------------------------------------
+# JumpCloud admin API key.
+export JUMPCLOUD_API_KEY='jca_REPLACE_ME'
+
+# Palette system admin password (terraform output palette_admin_password).
+export PALETTE_SYSTEM_PASSWORD='REPLACE_ME'
+
+# Tenant admin password — the user identified by PALETTE_TENANT_ADMIN below.
+export PALETTE_TENANT_PASSWORD='REPLACE_ME'
+
+# --- Optional overrides (defaults live in inventory/group_vars/all.yml) -----
+# export PALETTE_BASE_URL='https://palette.example.com'
+# export PALETTE_TENANT_ADMIN='admin@example.com'
+# export PALETTE_TENANT_NAME='default'                 # or 'ISC', etc.
+# export PALETTE_TEAM_ROLE_NAME='Tenant Admin'
+# export PALETTE_EKS_CLUSTER_NAME='spectroihmeae-ue2-palette'
+# export AWS_REGION='us-east-2'
+# export AWS_PROFILE='spectro'

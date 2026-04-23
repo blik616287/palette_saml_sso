@@ -4,6 +4,34 @@ Ansible playbook that fully automates the SAML SSO setup between a Spectro Cloud
 
 All resource names are prefixed with the tenant name so multiple tenants can be configured side-by-side without collision.
 
+## Quickstart
+
+```bash
+cd ansible/palette_saml_sso
+
+# 1. Create your local env file from the template and fill in the 3 required secrets.
+cp sso-env.sh.example sso-env.sh
+chmod 600 sso-env.sh
+$EDITOR sso-env.sh
+#   JUMPCLOUD_API_KEY          (jca_...)
+#   PALETTE_SYSTEM_PASSWORD    (terraform output palette_admin_password)
+#   PALETTE_TENANT_PASSWORD    (password for PALETTE_TENANT_ADMIN)
+
+# 2. Source the env.
+source sso-env.sh
+
+# 3. Run the playbook. Defaults target the "default" tenant.
+ansible-playbook playbook.yml
+
+# Run against another tenant — override via env:
+PALETTE_TENANT_NAME=ISC ansible-playbook playbook.yml
+
+# Tear down what the playbook created for a given tenant (scoped, safe):
+PALETTE_TENANT_NAME=ISC ansible-playbook teardown.yml
+```
+
+`sso-env.sh` is gitignored so real credentials won't get committed. The `sso-env.sh.example` template in the repo shows every variable the playbook consumes, with comments for every optional override.
+
 ## What it does
 
 1. **Palette tenant ensure**: Logs in as system admin, creates the tenant if missing, reactivates it if soft-deleted (API + MongoDB fallback).
